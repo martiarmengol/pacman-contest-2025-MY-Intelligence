@@ -231,20 +231,31 @@ class SmartDefensiveAgent(ReflexCaptureAgent):
     A defensive agent that patrols and intercepts invaders.
     
     Strategy:
-    1. Intercept: If an invader is seen, calculate a safe path to intercept them immediately.
+    1. Intercept: If an invader is seen, use Minimax to predict their escape and cut them off.
     2. Patrol: If no enemies are visible, patrol key "choke points" (narrow passages) to block entry.
     """
     def choose_action(self, game_state):
         enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
         invaders = [a for a in enemies if a.is_pacman and a.get_position()]
         
-        # 1. Intercept Invader
+        # 1. Intercept Invader using Minimax
         if invaders:
-            # Simple chase logic: move towards the closest invader
             closest_invader = min(invaders, key=lambda a: self.get_maze_distance(game_state.get_agent_position(self.index), a.get_position()))
-            action = self._get_safe_path(game_state, closest_invader.get_position())
-            if action:
-                return action
+            
+            # Get the invader's agent index
+            invader_index = None
+            for i in self.get_opponents(game_state):
+                if game_state.get_agent_state(i).get_position() == closest_invader.get_position():
+                    invader_index = i
+                    break
+            
+            if invader_index is not None:
+                # Use Minimax to predict best interception move
+                _, best_action = self.minimax(game_state, invader_index, depth=3, 
+                                              alpha=-float('inf'), beta=float('inf'), 
+                                              is_maximizing=True)
+                if best_action:
+                    return best_action
             
         # 2. Patrol Choke Points
         if not self.choke_points:
@@ -259,6 +270,95 @@ class SmartDefensiveAgent(ReflexCaptureAgent):
             return action
             
         return random.choice(game_state.get_legal_actions(self.index))
+
+    def minimax(self, game_state, invader_index, depth, alpha, beta, is_maximizing):
+        """
+        Minimax with Alpha-Beta Pruning to predict invader movement and intercept.
+        
+        Returns: (best_value, best_action)
+        """
+        # Base case: depth limit reached
+        if depth == 0:
+            return self.evaluate_defensive_state(game_state, invader_index), None
+        
+        # Check if invader was caught or escaped
+        invader_pos = game_state.get_agent_position(invader_index)
+        if not invader_pos:  # Invader returned home (escaped)
+            return -1000, None
+        
+        my_pos = game_state.get_agent_position(self.index)
+        if my_pos == invader_pos:  # Caught!
+            return 1000, None
+        
+        if is_maximizing:
+            # Our turn (defender): maximize value (minimize distance to invader)
+            max_value = -float('inf')
+            best_action = None
+            
+            actions = game_state.get_legal_actions(self.index)
+            # Move ordering: prioritize moving toward invader
+            actions = sorted(actions, key=lambda a: -self._action_priority(game_state, a, invader_pos))
+            
+            for action in actions:
+                successor = self.get_successor(game_state, action)
+                value, _ = self.minimax(successor, invader_index, depth - 1, alpha, beta, False)
+                
+                if value > max_value:
+                    max_value = value
+                    best_action = action
+                
+                alpha = max(alpha, value)
+                if beta <= alpha:
+                    break  # Beta cutoff
+            
+            return max_value, best_action
+        else:
+            # Invader's turn: minimize value (maximize distance from us)
+            min_value = float('inf')
+            
+            invader_actions = game_state.get_legal_actions(invader_index)
+            
+            for action in invader_actions:
+                successor = game_state.generate_successor(invader_index, action)
+                value, _ = self.minimax(successor, invader_index, depth - 1, alpha, beta, True)
+                
+                min_value = min(min_value, value)
+                beta = min(beta, value)
+                if beta <= alpha:
+                    break  # Alpha cutoff
+            
+            return min_value, None
+
+    def evaluate_defensive_state(self, game_state, invader_index):
+        """
+        Evaluation function for defensive Minimax.
+        Returns a score where higher is better for the defender.
+        """
+        my_pos = game_state.get_agent_position(self.index)
+        invader_pos = game_state.get_agent_position(invader_index)
+        
+        if not invader_pos:  # Invader escaped
+            return -1000
+        
+        distance = self.get_maze_distance(my_pos, invader_pos)
+        
+        # Negative distance because closer is better
+        # Add bonus if invader is far from their home
+        invader_state = game_state.get_agent_state(invader_index)
+        bonus = 0
+        if invader_state.num_carrying > 0:
+            bonus = invader_state.num_carrying * 10  # More valuable to catch if carrying food
+        
+        return -distance + bonus
+
+    def action_priority(self, game_state, action, target_pos):
+        """
+        Helper to prioritize actions that move toward the target.
+        Used for move ordering in minimax to improve alpha-beta pruning.
+        """
+        successor = self.get_successor(game_state, action)
+        new_pos = successor.get_agent_position(self.index)
+        return -self.get_maze_distance(new_pos, target_pos)
 
     def get_features(self, game_state, action):
         features = util.Counter()
