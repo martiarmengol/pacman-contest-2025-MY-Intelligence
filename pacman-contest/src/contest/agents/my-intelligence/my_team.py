@@ -147,80 +147,480 @@ class ReflexCaptureAgent(CaptureAgent):
 
 class SmartOffensiveAgent(ReflexCaptureAgent):
     """
-    A reflex agent that seeks food using A* pathfinding.
-    
-    Strategy:
-    1. Safety First: If a ghost is nearby (within 5 steps), switch to reactive mode to survive.
-    2. Goal Selection:
-       - If carrying a lot of food or time is running out -> Return Home.
-       - If ghosts are chasing us -> Go for a Power Capsule.
-       - Otherwise -> Go for the nearest Food.
-    3. Pathfinding: Use A* to find a safe path to the selected goal, avoiding ghosts.
+    Smart Offensive Agent mejorado:
+    - Usa el marcador real del juego (self.get_score).
+    - Cambia dinámicamente entre modo 'attack' y 'retreat'.
+    - Safety solo actúa cuando hay fantasmas activos visibles.
+    - No penaliza choke points si no hay peligro real.
+    - Recompensa fuerte por comer comida y por acercarse a comida cercana.
+    - Evita bucles con memoria de posiciones.
+    - Usa Monte Carlo SOLO cuando está siendo campeado al intentar entrar a territorio enemigo.
     """
+
+    def __init__(self, index, time_for_computing=0.1):
+        super().__init__(index, time_for_computing)
+        self.mode = "attack"  # attack | retreat
+        self.visited_positions = util.Counter()
+
     def choose_action(self, game_state):
-        my_pos = game_state.get_agent_position(self.index)
-        food_list = self.get_food(game_state).as_list()
-        capsules = self.get_capsules(game_state)
-        
-        # 1. Safety First (Expectimax-lite)
-        # If a ghost is too close, fall back to feature-based reactive movement
+        my_state = game_state.get_agent_state(self.index)
+        my_pos = my_state.get_position()
+
+        # 1) Actualizar historial de posiciones con decaimiento
+        for pos in list(self.visited_positions.keys()):
+            self.visited_positions[pos] *= 0.9
+            if self.visited_positions[pos] < 0.1:
+                del self.visited_positions[pos]
+
+        if my_state.num_returned > 0:
+            self.visited_positions.clear()
+
+        self.visited_positions[my_pos] += 1
+
+        # 2) Analizar enemigos y decidir modo (attack/retreat)
         enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-        ghosts = [a for a in enemies if not a.is_pacman and a.get_position() and a.scared_timer < 5]
-        if ghosts:
-            min_dist = min([self.get_maze_distance(my_pos, g.get_position()) for g in ghosts])
-            if min_dist <= 5:
-                return self._choose_reactive_action(game_state)
+        ghosts = [e for e in enemies if not e.is_pacman and e.get_position() is not None]
+        active_ghosts = [g for g in ghosts if g.scared_timer == 0]
+        scared_ghosts = [g for g in ghosts if g.scared_timer > 0]
 
-        # 2. Strategic Goal Selection
-        target = None
-        
-        # Return home logic
-        carry_amount = game_state.get_agent_state(self.index).num_carrying
+        close_active_ghost = False
+        if active_ghosts and my_state.is_pacman:
+            dists = [self.get_maze_distance(my_pos, g.get_position()) for g in active_ghosts]
+            close_active_ghost = (min(dists) <= 3)
+
         time_left = game_state.data.timeleft
-        if carry_amount > 0 and (carry_amount >= 5 or time_left < 200 or not food_list):
-             target = self.start 
-             
-        # Capsule logic
-        if not target and capsules and ghosts:
-            target = min(capsules, key=lambda c: self.get_maze_distance(my_pos, c))
-            
-        # Food logic
-        if not target and food_list:
-            target = min(food_list, key=lambda f: self.get_maze_distance(my_pos, f))
-            
-        # 3. Pathfinding
-        action = self._get_safe_path(game_state, target)
-        if action:
-            return action
-            
-        return self._choose_reactive_action(game_state)
 
-    def _choose_reactive_action(self, game_state):
+        if my_state.num_carrying >= 4 or time_left < 200 or close_active_ghost:
+            self.mode = "retreat"
+        else:
+            self.mode = "attack"
+
+        # 3) Acciones legales
         actions = game_state.get_legal_actions(self.index)
-        values = [self.evaluate(game_state, a) for a in actions]
+
+        # 4) Safety (solo cuando hay fantasmas activos visibles)
+        safe_actions = self.get_safe_actions(game_state, actions)
+        if not safe_actions:
+            safe_actions = actions
+
+        # ---------- MONTE CARLO: caso “me campean para entrar” ----------
+        loop_level = self.visited_positions[my_pos]
+        if self.is_camped_entering(game_state, my_state, my_pos, active_ghosts, loop_level):
+            candidate_actions = safe_actions if safe_actions else actions
+            return self.monte_carlo_escape(game_state, candidate_actions,
+                                           num_rollouts=6, depth=14)
+        # ----------------------------------------------------------------
+
+        # ---------- MODO "FOOD GREEDY" SIN PELIGRO ----------
+        # Si no hay fantasmas activos y la comida está relativamente cerca,
+        # elegimos la acción que minimiza la distancia a la comida tras movernos.
+        food_list = self.get_food(game_state).as_list()
+
+        min_food_dist = None
+        if food_list:
+            min_food_dist = min(self.get_maze_distance(my_pos, f) for f in food_list)
+
+        if not active_ghosts and min_food_dist is not None and min_food_dist <= 4:
+            # No queremos considerar STOP en el modo greedy,
+            # salvo que sea la única acción posible.
+            candidate_actions = [a for a in safe_actions if a != Directions.STOP]
+            if not candidate_actions:
+                candidate_actions = safe_actions  # fallback raro, pero por seguridad
+
+            def dist_to_food_after(a):
+                succ = self.get_successor(game_state, a)
+                succ_pos = succ.get_agent_position(self.index)
+
+                # Usamos SIEMPRE la lista de comida del estado ACTUAL,
+                # para que comer un pellet cercano se considere "acercarse" a él.
+                return min(self.get_maze_distance(succ_pos, f) for f in food_list)
+
+            best_dist = min(dist_to_food_after(a) for a in candidate_actions)
+            best_food_actions = [a for a in candidate_actions if dist_to_food_after(a) == best_dist]
+
+            return random.choice(best_food_actions)
+        # -----------------------------------------------------
+
+        # 5) ROMPE–BUCLES FUERTE (para otros casos)
+        if loop_level >= 2:
+            candidate_actions = safe_actions if safe_actions else actions
+
+            def successor_visits(a):
+                succ = self.get_successor(game_state, a)
+                succ_pos = succ.get_agent_position(self.index)
+                return self.visited_positions[succ_pos]
+
+            best_loop_action = min(candidate_actions, key=successor_visits)
+            return best_loop_action
+
+        # 6) Evaluar normalmente si no estamos en bucle
+        values = [self.evaluate(game_state, a) for a in safe_actions]
         max_value = max(values)
-        best_actions = [a for a, v in zip(actions, values) if v == max_value]
+        best_actions = [a for a, v in zip(safe_actions, values) if v == max_value]
+
+        if Directions.STOP in best_actions and len(best_actions) > 1:
+            best_actions.remove(Directions.STOP)
+
         return random.choice(best_actions)
+
+    # ========= Helpers Monte Carlo SOLO PARA ENTRAR =========
+
+    def is_camped_entering(self, game_state, my_state, my_pos, active_ghosts, loop_level):
+        """
+        Detecta la situación: quiero entrar a territorio enemigo pero me campean en la frontera.
+
+        Condiciones:
+        - Soy FANTASMA (aún en mi lado) -> my_state.is_pacman == False
+        - Estoy en modo ataque (quiero ir a comer comida).
+        - Hay fantasmas activos visibles.
+        - Llevo un mínimo de visitas en esta casilla (bucle local).
+        - Estoy cerca de la frontera.
+        - Algún fantasma activo está relativamente cerca.
+        """
+        # Solo nos interesa este Monte Carlo cuando AÚN NO soy Pacman
+        if my_state.is_pacman:
+            return False
+
+        # Solo tiene sentido en modo ataque (no volviendo a casa)
+        if self.mode != "attack":
+            return False
+
+        if not active_ghosts:
+            return False
+
+        if loop_level < 2:
+            return False
+
+        # Frontera vertical aproximada
+        width = game_state.data.layout.width
+        if self.red:
+            frontier_x = (width // 2) - 1
+        else:
+            frontier_x = (width // 2)
+
+        # ¿Estoy razonablemente cerca de la frontera?
+        if abs(my_pos[0] - frontier_x) > 2:
+            return False
+
+        # Distancia al fantasma activo más cercano
+        dists = [
+            self.get_maze_distance(my_pos, g.get_position())
+            for g in active_ghosts
+            if g.get_position() is not None
+        ]
+        if not dists:
+            return False
+
+        min_dist = min(dists)
+
+        # “Cerca”: umbral ajustable
+        return min_dist <= 4
+
+    def monte_carlo_escape(self, game_state, candidate_actions,
+                           num_rollouts=6, depth=14):
+        """
+        Monte Carlo simple:
+        - Para cada acción candidata, simula varias trayectorias aleatorias
+          (sin STOP y evitando ir siempre marcha atrás).
+        - Evalúa el estado final con self.evaluate.
+        - Escoge la acción con mejor valor medio.
+        """
+        # Evitar STOP como acción inicial si hay alternativas
+        filtered_candidates = [a for a in candidate_actions if a != Directions.STOP]
+        if filtered_candidates:
+            candidate_actions = filtered_candidates
+
+        best_action = None
+        best_value = -float('inf')
+
+        for a in candidate_actions:
+            total = 0.0
+            for _ in range(num_rollouts):
+                state = game_state.generate_successor(self.index, a)
+                steps = depth
+                while steps > 0:
+                    legal = state.get_legal_actions(self.index)
+                    if not legal:
+                        break
+                    # No quedarnos parados en el rollout
+                    if Directions.STOP in legal and len(legal) > 1:
+                        legal.remove(Directions.STOP)
+                    # Evitar ir siempre marcha atrás
+                    cur_dir = state.get_agent_state(self.index).configuration.direction
+                    rev = Directions.REVERSE[cur_dir]
+                    if rev in legal and len(legal) > 1:
+                        legal.remove(rev)
+
+                    next_a = random.choice(legal)
+                    state = state.generate_successor(self.index, next_a)
+                    steps -= 1
+
+                # Usamos evaluate sobre el estado final (acción dummy)
+                total += self.evaluate(state, Directions.STOP)
+
+            avg_value = total / float(num_rollouts)
+            if avg_value > best_value:
+                best_value = avg_value
+                best_action = a
+
+        # Por seguridad
+        if best_action is None:
+            return random.choice(candidate_actions)
+
+        return best_action
+
+    # ========= Resto de métodos (sin cambios de lógica) =========
+
+    def get_safe_actions(self, game_state, actions):
+        """
+        Capa de seguridad:
+        - NO hace nada si no hay fantasmas activos visibles.
+        - Si los hay, evita casillas ADYACENTES al fantasma.
+        - Si todas son malas, escoge la que maximiza la distancia al fantasma más cercano.
+        """
+        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
+        defenders = [a for a in enemies
+                     if not a.is_pacman and a.get_position() is not None and a.scared_timer == 0]
+
+        # Si no hay fantasmas activos visibles, no filtramos nada
+        if len(defenders) == 0:
+            return actions
+
+        my_pos = game_state.get_agent_position(self.index)
+        safe_actions = []
+
+        for action in actions:
+            successor = self.get_successor(game_state, action)
+            successor_pos = successor.get_agent_position(self.index)
+
+            is_safe = True
+            for defender in defenders:
+                # Solo consideramos peligrosa una casilla adyacente al fantasma
+                if self.get_maze_distance(successor_pos, defender.get_position()) <= 1:
+                    is_safe = False
+                    break
+            if is_safe:
+                safe_actions.append(action)
+
+        if not safe_actions:
+            # Elegimos la "menos mala": maximiza distancia al fantasma más cercano
+            closest_defender = min(
+                defenders,
+                key=lambda d: self.get_maze_distance(my_pos, d.get_position())
+            )
+            best_panic_action = max(
+                actions,
+                key=lambda a: self.get_maze_distance(
+                    self.get_successor(game_state, a).get_agent_position(self.index),
+                    closest_defender.get_position()
+                )
+            )
+            return [best_panic_action]
+
+        return safe_actions
 
     def get_features(self, game_state, action):
         features = util.Counter()
-        successor = self.get_successor(game_state, action)
-        my_pos = successor.get_agent_state(self.index).get_position()
-        
-        features['successor_score'] = -len(self.get_food(successor).as_list())
 
-        enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
-        ghosts = [a for a in enemies if not a.is_pacman and a.get_position() and a.scared_timer < 5]
-        if ghosts:
-            dists = [self.get_maze_distance(my_pos, g.get_position()) for g in ghosts]
-            min_dist = min(dists)
-            if min_dist <= 1: features['ghost_distance'] = -1000
-            elif min_dist <= 2: features['ghost_distance'] = -100
-            
+        successor = self.get_successor(game_state, action)
+        my_state_succ = successor.get_agent_state(self.index)
+        my_pos_succ = my_state_succ.get_position()
+
+        my_state_curr = game_state.get_agent_state(self.index)
+        # my_pos_curr = my_state_curr.get_position()  # por si lo quieres para debug
+
+        # --- Marcador real del juego ---
+        features['successor_score'] = self.get_score(successor)
+
+        # --- Comida enemiga ---
+        food_list_succ = self.get_food(successor).as_list()
+        features['distance_to_food'] = 0
+        features['remaining_food'] = 0
+        features['adjacent_food'] = 0
+
+        if food_list_succ:
+            dists_food = [self.get_maze_distance(my_pos_succ, f) for f in food_list_succ]
+            features['distance_to_food'] = min(dists_food)
+            features['remaining_food'] = len(food_list_succ)
+
+            # Bonus por estar a un solo paso de alguna comida
+            for f, d in zip(food_list_succ, dists_food):
+                if d == 1:
+                    features['adjacent_food'] = 1
+                    break
+
+        # --- BONUS directo por comer comida ---
+        if my_state_succ.num_carrying > my_state_curr.num_carrying:
+            features['eat_food'] = my_state_succ.num_carrying - my_state_curr.num_carrying
+        else:
+            features['eat_food'] = 0
+
+        # --- Volver a casa cuando llevamos comida ---
+        if my_state_succ.num_carrying > 0:
+            features['distance_to_home'] = self.distance_to_home(my_pos_succ)
+        else:
+            features['distance_to_home'] = 0
+
+        # --- Cápsulas enemigas ---
+        capsules_succ = self.get_capsules(successor)
+        if capsules_succ:
+            features['distance_to_capsule'] = min(
+                self.get_maze_distance(my_pos_succ, c) for c in capsules_succ
+            )
+        else:
+            features['distance_to_capsule'] = 0
+
+        # --- Bucles (penalizar posiciones visitadas) ---
+        visited_count = self.visited_positions.get(my_pos_succ, 0.0)
+        features['visited_penalty'] = visited_count
+
+        # --- Relación con fantasmas (activos y asustados) ---
+        enemies_succ = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
+        ghosts_succ = [e for e in enemies_succ if not e.is_pacman and e.get_position() is not None]
+        active_ghosts = [g for g in ghosts_succ if g.scared_timer == 0]
+        scared_ghosts = [g for g in ghosts_succ if g.scared_timer > 0]
+
+        if active_ghosts:
+            dists_active = [self.get_maze_distance(my_pos_succ, g.get_position()) for g in active_ghosts]
+            features['active_ghost_distance'] = min(dists_active)
+        else:
+            features['active_ghost_distance'] = 0
+
+        if scared_ghosts:
+            dists_scared = [self.get_maze_distance(my_pos_succ, g.get_position()) for g in scared_ghosts]
+            features['scared_ghost_distance'] = min(dists_scared)
+        else:
+            features['scared_ghost_distance'] = 0
+
+        # --- Choke points: solo problema si hay fantasmas activos cercanos ---
+        features['in_choke'] = 0
+        if my_pos_succ in self.choke_points and active_ghosts:
+            dists_active = [self.get_maze_distance(my_pos_succ, g.get_position()) for g in active_ghosts]
+            if dists_active and min(dists_active) <= 8:
+                features['in_choke'] = 1
+
+        # --- Penalizar quedarse quieto ---
+        features['stop'] = 1 if action == Directions.STOP else 0
+
         return features
 
     def get_weights(self, game_state, action):
-        return {'successor_score': 100, 'ghost_distance': 1}
+        """
+        Pesos dinámicos según el modo (attack / retreat) y la situación.
+        - Cápsulas solo pesan mucho si hay fantasmas activos cerca.
+        - Comer comida tiene un premio muy fuerte.
+        - Choke points solo importan cuando hay peligro.
+        """
+        successor = self.get_successor(game_state, action)
+        my_state_succ = successor.get_agent_state(self.index)
+        my_pos_succ = my_state_succ.get_position()
+        # --- Distancia a la comida EN get_weights (para reglas especiales) ---
+        foods_succ = self.get_food(successor).as_list()
+        dist_food_succ = None
+        if foods_succ:
+            dist_food_succ = min(self.get_maze_distance(my_pos_succ, f) for f in foods_succ)
+
+        time_left = game_state.data.timeleft
+
+        enemies_succ = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
+        ghosts_succ = [e for e in enemies_succ if not e.is_pacman and e.get_position() is not None]
+        active_ghosts = [g for g in ghosts_succ if g.scared_timer == 0]
+        scared_ghosts = [g for g in ghosts_succ if g.scared_timer > 0]
+
+        min_active_dist = None
+        if active_ghosts:
+            dists_active = [self.get_maze_distance(my_pos_succ, g.get_position()) for g in active_ghosts]
+            min_active_dist = min(dists_active)
+
+        # Recalcular distancia a cápsula aquí:
+        capsules_succ = self.get_capsules(successor)
+        if capsules_succ:
+            dist_capsule = min(self.get_maze_distance(my_pos_succ, c) for c in capsules_succ)
+        else:
+            dist_capsule = None
+
+        # Peso base oportunista (más alto que antes)
+        capsule_weight = -2
+
+        # Si la cápsula está CERCA (oportunidad clara)
+        if dist_capsule is not None and dist_capsule <= 5:
+            capsule_weight = -5  # ve a por ella agresivamente
+
+        # Si hay fantasmas activos visibles → comportamiento defensivo clásico
+        if min_active_dist is not None:
+            if min_active_dist <= 5:
+                capsule_weight = -12     # riesgo alto → prioridad máxima
+            elif min_active_dist <= 8:
+                capsule_weight = -5     # riesgo medio
+            else:
+                capsule_weight = -3     # riesgo bajo pero presente
+
+        # Si los fantasmas visibles están asustados → baja prioridad
+        if active_ghosts == [] and scared_ghosts:
+            capsule_weight *= 0.3       # no desperdiciar cápsula
+
+        # --- Pesos base para modos ---
+
+        # MODO ATAQUE: priorizar MUY fuerte ir hacia comida y comerla.
+        weights_attack = {
+            'successor_score': 50,
+            'distance_to_food': -12,
+            'remaining_food': -0.5,
+            'eat_food': 60,          # recompensa directa por comer
+            'adjacent_food': 40,     # bonus por estar a 1 paso
+            'distance_to_home': 0,
+            'distance_to_capsule': capsule_weight,
+            'visited_penalty': -4,
+            'active_ghost_distance': 0,   # safety ya evita suicidios
+            'scared_ghost_distance': 0.5,
+            'in_choke': -1.5,
+            'stop': -200,
+        }
+
+        # MODO RETIRADA: importa llegar a casa y no morir.
+        weights_retreat = {
+            'successor_score': 220,
+            'distance_to_food': -0.5,
+            'remaining_food': 0,
+            'eat_food': 5,
+            'adjacent_food': 5,
+            'distance_to_home': -12,
+            'distance_to_capsule': capsule_weight,
+            'visited_penalty': -5,
+            'active_ghost_distance': 5,
+            'scared_ghost_distance': 0.3,
+            'in_choke': -6,
+            'stop': -40,
+        }
+
+        # --- Ajustes según modo, carga y tiempo ---
+        if self.mode == "attack":
+            w = weights_attack
+
+            # Solo empezamos a valorar volver a casa si vamos cargados y hay peligro
+            if active_ghosts and my_state_succ.num_carrying >= 3 and min_active_dist is not None:
+                if min_active_dist <= 7.5:
+                    w['distance_to_home'] = -3
+                else:
+                    w['distance_to_home'] = 0
+            else:
+                w['distance_to_home'] = 0
+
+            if time_left < 200:
+                w['distance_to_home'] = -8
+                w['successor_score'] = 140
+        else:
+            w = weights_retreat
+            if my_state_succ.num_carrying > 5 or time_left < 150:
+                w['distance_to_home'] = -12
+                w['successor_score'] = 250
+
+        # Si no hay fantasmas activos y la comida está muy cerca,
+        # bajamos mucho la penalización por casillas visitadas para que ENTRE al pasillo.
+        if not active_ghosts and dist_food_succ is not None and dist_food_succ <= 2:
+            w['visited_penalty'] = 0   # o -1 si quieres un pelín de castigo
+
+        return w
 
 ##########
 # Defensive Agent #
