@@ -232,15 +232,32 @@ class SmartDefensiveAgent(ReflexCaptureAgent):
     
     Strategy:
     1. Intercept: If an invader is seen, use Minimax to predict their escape and cut them off.
-    2. Patrol: If no enemies are visible, patrol key "choke points" (narrow passages) to block entry.
+    2. Food Memory: Track eaten food and patrol that location even when invader disappears.
+    3. Patrol: If no enemies visible and no food eaten, patrol border near food clusters.
     """
+    
+    def __init__(self, index, time_for_computing=.1):
+        super().__init__(index, time_for_computing)
+        self.previous_food = []
+        self.target = None
+    
+    def register_initial_state(self, game_state):
+        super().register_initial_state(game_state)
+        self.previous_food = self.get_food_you_are_defending(game_state).as_list()
+    
     def choose_action(self, game_state):
+        my_pos = game_state.get_agent_position(self.index)
+        
+        # Clear target if we reached it
+        if my_pos == self.target:
+            self.target = None
+        
         enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
         invaders = [a for a in enemies if a.is_pacman and a.get_position()]
         
-        # 1. Intercept Invader using Minimax
+        # 1. Intercept Visible Invader using Minimax
         if invaders:
-            closest_invader = min(invaders, key=lambda a: self.get_maze_distance(game_state.get_agent_position(self.index), a.get_position()))
+            closest_invader = min(invaders, key=lambda a: self.get_maze_distance(my_pos, a.get_position()))
             
             # Get the invader's agent index
             invader_index = None
@@ -252,20 +269,50 @@ class SmartDefensiveAgent(ReflexCaptureAgent):
             if invader_index is not None:
                 # Use Minimax to predict best interception move
                 _, best_action = self.minimax(game_state, invader_index, depth=3, 
-                                              alpha=-float('inf'), beta=float('inf'), 
-                                              is_maximizing=True)
+                                            alpha=-float('inf'), beta=float('inf'), 
+                                            is_maximizing=True)
                 if best_action:
                     return best_action
-            
-        # 2. Patrol Choke Points
-        if not self.choke_points:
-            self.choke_points = self._identify_choke_points(game_state)
-            
-        target = self.start
-        if self.choke_points:
-            target = random.choice(self.choke_points)
-            
-        action = self._get_safe_path(game_state, target)
+        
+        # 2. Food Memory: Check if food was eaten (invader now invisible)
+        current_food = self.get_food_you_are_defending(game_state).as_list()
+        
+        if len(current_food) < len(self.previous_food):
+            # Food was eaten! Find which one and target it
+            eaten_food = set(self.previous_food) - set(current_food)
+            self.target = eaten_food.pop()  # Target the eaten food location
+        
+        # Update food memory for next turn
+        self.previous_food = current_food
+        
+        # 3. Determine patrol target
+        if self.target is None:
+            # No specific target, patrol border near food
+            if current_food:
+                # Find border position closest to our food
+                width = game_state.data.layout.width
+                if self.red:
+                    border_x = width // 2 - 1
+                else:
+                    border_x = width // 2
+                
+                # Generate candidate border positions
+                height = game_state.data.layout.height
+                border_positions = [(border_x, y) for y in range(height) 
+                                   if not game_state.has_wall(border_x, y)]
+                
+                if border_positions:
+                    # Pick border position closest to food cluster center
+                    avg_food_y = sum(y for x, y in current_food) / len(current_food)
+                    self.target = min(border_positions, key=lambda pos: abs(pos[1] - avg_food_y))
+                else:
+                    self.target = self.start
+            else:
+                # No food left, return to start
+                self.target = self.start
+        
+        # Move toward target
+        action = self._get_safe_path(game_state, self.target)
         if action:
             return action
             
@@ -297,7 +344,7 @@ class SmartDefensiveAgent(ReflexCaptureAgent):
             
             actions = game_state.get_legal_actions(self.index)
             # Move ordering: prioritize moving toward invader
-            actions = sorted(actions, key=lambda a: -self._action_priority(game_state, a, invader_pos))
+            actions = sorted(actions, key=lambda a: -self.action_priority(game_state, a, invader_pos))
             
             for action in actions:
                 successor = self.get_successor(game_state, action)
