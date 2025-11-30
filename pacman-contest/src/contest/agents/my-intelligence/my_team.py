@@ -203,15 +203,13 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         if not safe_actions:
             safe_actions = actions
 
-        # ---------- MONTE CARLO: caso “me campean para entrar” ----------
+        # MODO "MONTE CARLO SOLO PARA ENTRAR"
         loop_level = self.visited_positions[my_pos]
         if self.is_camped_entering(game_state, my_state, my_pos, active_ghosts, loop_level):
-            candidate_actions = safe_actions if safe_actions else actions
+            candidate_actions = actions
             return self.monte_carlo_escape(game_state, candidate_actions,
-                                           num_rollouts=6, depth=14)
-        # ----------------------------------------------------------------
+                                           num_rollouts=10, depth=14)
 
-        # ---------- MODO "FOOD GREEDY" SIN PELIGRO ----------
         # Si no hay fantasmas activos y la comida está relativamente cerca,
         # elegimos la acción que minimiza la distancia a la comida tras movernos.
         food_list = self.get_food(game_state).as_list()
@@ -225,21 +223,21 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
             # salvo que sea la única acción posible.
             candidate_actions = [a for a in safe_actions if a != Directions.STOP]
             if not candidate_actions:
-                candidate_actions = safe_actions  # fallback raro, pero por seguridad
+                candidate_actions = safe_actions  # solo STOP disponible
 
             def dist_to_food_after(a):
                 succ = self.get_successor(game_state, a)
                 succ_pos = succ.get_agent_position(self.index)
 
                 # Usamos SIEMPRE la lista de comida del estado ACTUAL,
-                # para que comer un pellet cercano se considere "acercarse" a él.
+                # para que comer un punto cercano se considere "acercarse" a él.
                 return min(self.get_maze_distance(succ_pos, f) for f in food_list)
 
             best_dist = min(dist_to_food_after(a) for a in candidate_actions)
             best_food_actions = [a for a in candidate_actions if dist_to_food_after(a) == best_dist]
 
             return random.choice(best_food_actions)
-        # -----------------------------------------------------
+
 
         # 5) ROMPE–BUCLES FUERTE (para otros casos)
         if loop_level >= 2:
@@ -263,7 +261,7 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
 
         return random.choice(best_actions)
 
-    # ========= Helpers Monte Carlo SOLO PARA ENTRAR =========
+    # Helpers Monte Carlo SOLO PARA ENTRAR
 
     def is_camped_entering(self, game_state, my_state, my_pos, active_ghosts, loop_level):
         """
@@ -288,7 +286,7 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         if not active_ghosts:
             return False
 
-        if loop_level < 2:
+        if loop_level < 1:
             return False
 
         # Frontera vertical aproximada
@@ -299,7 +297,7 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
             frontier_x = (width // 2)
 
         # ¿Estoy razonablemente cerca de la frontera?
-        if abs(my_pos[0] - frontier_x) > 2:
+        if abs(my_pos[0] - frontier_x) > 3:
             return False
 
         # Distancia al fantasma activo más cercano
@@ -314,10 +312,10 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         min_dist = min(dists)
 
         # “Cerca”: umbral ajustable
-        return min_dist <= 4
+        return min_dist <= 5
 
     def monte_carlo_escape(self, game_state, candidate_actions,
-                           num_rollouts=6, depth=14):
+                           num_rollouts=10, depth=14):
         """
         Monte Carlo simple:
         - Para cada acción candidata, simula varias trayectorias aleatorias
@@ -355,7 +353,7 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
                     state = state.generate_successor(self.index, next_a)
                     steps -= 1
 
-                # Usamos evaluate sobre el estado final (acción dummy)
+                # Usamos evaluate sobre el estado final
                 total += self.evaluate(state, Directions.STOP)
 
             avg_value = total / float(num_rollouts)
@@ -368,8 +366,6 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
             return random.choice(candidate_actions)
 
         return best_action
-
-    # ========= Resto de métodos (sin cambios de lógica) =========
 
     def get_safe_actions(self, game_state, actions):
         """
@@ -427,12 +423,11 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         my_pos_succ = my_state_succ.get_position()
 
         my_state_curr = game_state.get_agent_state(self.index)
-        # my_pos_curr = my_state_curr.get_position()  # por si lo quieres para debug
 
-        # --- Marcador real del juego ---
+        # Marcador real del juego
         features['successor_score'] = self.get_score(successor)
 
-        # --- Comida enemiga ---
+        # Comida enemiga
         food_list_succ = self.get_food(successor).as_list()
         features['distance_to_food'] = 0
         features['remaining_food'] = 0
@@ -449,19 +444,19 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
                     features['adjacent_food'] = 1
                     break
 
-        # --- BONUS directo por comer comida ---
+        # BONUS directo por comer comida
         if my_state_succ.num_carrying > my_state_curr.num_carrying:
             features['eat_food'] = my_state_succ.num_carrying - my_state_curr.num_carrying
         else:
             features['eat_food'] = 0
 
-        # --- Volver a casa cuando llevamos comida ---
+        # Volver a casa cuando llevamos comida
         if my_state_succ.num_carrying > 0:
             features['distance_to_home'] = self.distance_to_home(my_pos_succ)
         else:
             features['distance_to_home'] = 0
 
-        # --- Cápsulas enemigas ---
+        # Cápsulas enemigas
         capsules_succ = self.get_capsules(successor)
         if capsules_succ:
             features['distance_to_capsule'] = min(
@@ -470,11 +465,11 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         else:
             features['distance_to_capsule'] = 0
 
-        # --- Bucles (penalizar posiciones visitadas) ---
+        # Bucles (penalizar posiciones visitadas)
         visited_count = self.visited_positions.get(my_pos_succ, 0.0)
         features['visited_penalty'] = visited_count
 
-        # --- Relación con fantasmas (activos y asustados) ---
+        # Relación con fantasmas (activos y asustados)
         enemies_succ = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
         ghosts_succ = [e for e in enemies_succ if not e.is_pacman and e.get_position() is not None]
         active_ghosts = [g for g in ghosts_succ if g.scared_timer == 0]
@@ -492,14 +487,14 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         else:
             features['scared_ghost_distance'] = 0
 
-        # --- Choke points: solo problema si hay fantasmas activos cercanos ---
+        # Choke points: solo problema si hay fantasmas activos cercanos
         features['in_choke'] = 0
         if my_pos_succ in self.choke_points and active_ghosts:
             dists_active = [self.get_maze_distance(my_pos_succ, g.get_position()) for g in active_ghosts]
             if dists_active and min(dists_active) <= 8:
                 features['in_choke'] = 1
 
-        # --- Penalizar quedarse quieto ---
+        # Penalizar quedarse quieto
         features['stop'] = 1 if action == Directions.STOP else 0
 
         return features
@@ -514,7 +509,7 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         successor = self.get_successor(game_state, action)
         my_state_succ = successor.get_agent_state(self.index)
         my_pos_succ = my_state_succ.get_position()
-        # --- Distancia a la comida EN get_weights (para reglas especiales) ---
+        # Distancia a la comida EN get_weights (para reglas especiales)
         foods_succ = self.get_food(successor).as_list()
         dist_food_succ = None
         if foods_succ:
@@ -539,7 +534,7 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         else:
             dist_capsule = None
 
-        # Peso base oportunista (más alto que antes)
+        # Peso base para cápsulas
         capsule_weight = -2
 
         # Si la cápsula está CERCA (oportunidad clara)
@@ -559,19 +554,19 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
         if active_ghosts == [] and scared_ghosts:
             capsule_weight *= 0.3       # no desperdiciar cápsula
 
-        # --- Pesos base para modos ---
+        # Pesos base para modos ataque y retirada
 
         # MODO ATAQUE: priorizar MUY fuerte ir hacia comida y comerla.
         weights_attack = {
             'successor_score': 50,
             'distance_to_food': -12,
             'remaining_food': -0.5,
-            'eat_food': 60,          # recompensa directa por comer
-            'adjacent_food': 40,     # bonus por estar a 1 paso
+            'eat_food': 60,          
+            'adjacent_food': 40,     
             'distance_to_home': 0,
             'distance_to_capsule': capsule_weight,
             'visited_penalty': -4,
-            'active_ghost_distance': 0,   # safety ya evita suicidios
+            'active_ghost_distance': 0,   
             'scared_ghost_distance': 0.5,
             'in_choke': -1.5,
             'stop': -200,
@@ -593,13 +588,13 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
             'stop': -40,
         }
 
-        # --- Ajustes según modo, carga y tiempo ---
+        # Ajustes según modo, carga y tiempo 
         if self.mode == "attack":
             w = weights_attack
 
             # Solo empezamos a valorar volver a casa si vamos cargados y hay peligro
             if active_ghosts and my_state_succ.num_carrying >= 3 and min_active_dist is not None:
-                if min_active_dist <= 7.5:
+                if min_active_dist <= 8:
                     w['distance_to_home'] = -3
                 else:
                     w['distance_to_home'] = 0
@@ -621,6 +616,7 @@ class SmartOffensiveAgent(ReflexCaptureAgent):
             w['visited_penalty'] = 0   # o -1 si quieres un pelín de castigo
 
         return w
+
 
 ##########
 # Defensive Agent #
