@@ -37,20 +37,48 @@ def create_team(first_index, second_index, is_red,
 class ReflexCaptureAgent(CaptureAgent):
     """
     Reflex Capture Agent base class.
-    Contains helper methods for map analysis, successor generation, and pathfinding.
+    Contains helper methods for map analysis and successor generation.
     """
 
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
         self.start = None
         self.choke_points = []
+        self.home_border = []  # ← NUEVO: casillas seguras para "volver a casa"
 
     def register_initial_state(self, game_state):
         self.start = game_state.get_agent_position(self.index)
-        self.choke_points = self._identify_choke_points(game_state)
+        self.choke_points = self.identify_choke_points(game_state)
+
+        # Cálculo de la frontera de casa (línea de medio mapa de tu lado)
+        width = game_state.data.layout.width
+        height = game_state.data.layout.height
+        mid_x = width // 2
+
+        if self.red:
+            border_x = mid_x - 1
+        else:
+            border_x = mid_x
+
+        self.home_border = [
+            (border_x, y)
+            for y in range(height)
+            if not game_state.has_wall(border_x, y)
+        ]
+
         CaptureAgent.register_initial_state(self, game_state)
 
-    def _identify_choke_points(self, game_state):
+    def distance_to_home(self, pos):
+        """
+        Distancia mínima desde 'pos' a una casilla segura de nuestro lado.
+        Si por algún motivo no tenemos home_border, usamos start.
+        """
+        if not self.home_border:
+            return self.get_maze_distance(pos, self.start)
+        return min(self.get_maze_distance(pos, b) for b in self.home_border)
+
+
+    def identify_choke_points(self, game_state):
         width, height = game_state.data.layout.width, game_state.data.layout.height
         choke_points = []
         for x in range(width):
@@ -139,7 +167,8 @@ class ReflexCaptureAgent(CaptureAgent):
                         if is_safe:
                             new_cost = len(path) + 1 + util.manhattan_distance(next_pos, target_pos)
                             frontier.push((next_pos, path + [action]), new_cost)
-        return None
+        return None    
+
 
 ##########
 # Offensive Agent #
