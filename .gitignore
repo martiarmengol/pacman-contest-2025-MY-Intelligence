@@ -13,26 +13,3 @@
 # Allow the Team definition file
 !TEAM.md
 !my_team.py
-# ------------------------------------------------------
-# THE FIX: Walk down the directory path step-by-step
-# ------------------------------------------------------
-
-# 1. Open the main framework folder
-!pacman-contest/
-
-# 2. Open the source folder inside
-!pacman-contest/src/
-
-# 3. Open the contest folder
-!pacman-contest/src/contest/
-
-# 4. Open the agents folder
-!pacman-contest/src/contest/agents/
-
-# 5. Open YOUR specific agent folder
-!pacman-contest/src/contest/agents/my-intelligence/
-
-# ------------------------------------------------------
-# THE FILES: Now allow the specific files inside that folder
-# ------------------------------------------------------
-#!pacman-contest/src/contest/agents/my-intelligence/my_team.py
