@@ -12,7 +12,7 @@
 
 # Allow the Team definition file
 !TEAM.md
-
+!my_team.py
 # ------------------------------------------------------
 # THE FIX: Walk down the directory path step-by-step
 # ------------------------------------------------------
@@ -35,4 +35,4 @@
 # ------------------------------------------------------
 # THE FILES: Now allow the specific files inside that folder
 # ------------------------------------------------------
-!pacman-contest/src/contest/agents/my-intelligence/my_team.py
+#!pacman-contest/src/contest/agents/my-intelligence/my_team.py
